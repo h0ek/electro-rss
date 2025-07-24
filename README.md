@@ -30,7 +30,7 @@ sudo pacman -S python gobject-introspection gtk3 gdk-pixbuf2 python-requests pyt
 ```
 
 ## Uruchamianie
-Pobierz plik electro-rss.py i uruchom go komendą:
+Pobierz plik `electro-rss.py` i uruchom go komendą:
 ```
 python electro-rss.py
 ```
