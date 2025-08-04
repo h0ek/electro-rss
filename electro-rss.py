@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
+
+import subprocess
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('GdkPixbuf', '2.0')
 from gi.repository import Gtk, GdkPixbuf, GLib
 
 import threading
-import os, re, json, datetime, feedparser, requests, email.utils, webbrowser
+import os
+import re
+import json
+import datetime
+import feedparser
+import requests
+import email.utils
 
 # --- KONFIGURACJA RSS ---
 RSS_URLS = {
@@ -14,7 +22,10 @@ RSS_URLS = {
     'x265/1080p': 'https://electro-torrent.pl/rss.php?cat=1116',
     'Seriale':    'https://electro-torrent.pl/rss.php?cat=7',
 }
-CACHE_FILE = 'cache.json'
+
+# Cache w katalogu systemowym tymczasowym
+CACHE_DIR  = GLib.get_tmp_dir()              # np. "/tmp"
+CACHE_FILE = os.path.join(CACHE_DIR, 'cache.json')
 
 # Regex-y
 TITLE_RE   = re.compile(r'^(?P<title>.+?)\s*\((?P<year>\d{4})\)')
@@ -30,10 +41,11 @@ def fetch_items(days=7):
         feed = feedparser.parse(url)
         for e in feed.entries:
             try:
-                pub = (datetime.datetime(*e.published_parsed[:6])
-                       if e.published_parsed
-                       else email.utils.parsedate_to_datetime(e.published))
-            except:
+                if e.get('published_parsed'):
+                    pub = datetime.datetime(*e.published_parsed[:6])
+                else:
+                    pub = email.utils.parsedate_to_datetime(e.published)
+            except Exception:
                 continue
             if pub < cutoff:
                 continue
@@ -55,7 +67,7 @@ def fetch_items(days=7):
                 'year':     year,
                 'quality':  q.group(1) if q else '',
                 'lektor':   (lm.group(1).strip('[]') if lm else
-                             'Film Polski' if 'Film Polski' in txt else 'Nie'),
+                             ('Film Polski' if 'Film Polski' in txt else 'Nie')),
                 'napisy':   nm.group(1).strip('[]') if nm else 'Nie',
                 'dubbing':  dm.group(1).strip('[]') if dm else 'Nie',
                 'thumb':    e.media_thumbnail[0]['url'] if 'media_thumbnail' in e else '',
@@ -68,13 +80,11 @@ def fetch_items(days=7):
             if cat.lower() == 'seriale':
                 low = txt.lower()
                 s = ep = None
-
                 m1 = re.search(r's\s*(\d{1,2})\s*e\s*(\d{1,2})', low)
                 if m1:
                     s, ep = int(m1.group(1)), int(m1.group(2))
                 else:
-                    ms = re.search(r'\[s\s*(\d{1,2})\]', low) or \
-                         re.search(r'sezon\s*(\d{1,2})', low)
+                    ms = re.search(r'\[s\s*(\d{1,2})\]', low) or re.search(r'sezon\s*(\d{1,2})', low)
                     if ms:
                         s = int(ms.group(1))
                     mr = re.search(r'\[e\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\]', low)
@@ -84,11 +94,8 @@ def fetch_items(days=7):
                         me = re.search(r'e\s*(\d{1,2})', low)
                         if me:
                             ep = int(me.group(1))
-
-                if s is not None:
-                    itm['season'] = str(s)
-                if ep is not None:
-                    itm['episode'] = str(ep)
+                if s is not None: itm['season'] = str(s)
+                if ep is not None: itm['episode'] = str(ep)
 
             out.append(itm)
 
@@ -103,91 +110,93 @@ def load_cache():
         for d in data:
             d['pubDate'] = datetime.datetime.fromisoformat(d['pubDate'])
         return data
-    except:
+    except Exception:
         return []
 
 def save_cache(items):
-    to_save = []
-    for itm in items:
-        d = itm.copy()
-        d['pubDate'] = d['pubDate'].isoformat()
-        to_save.append(d)
-    with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(to_save, f, ensure_ascii=False, indent=2)
+    try:
+        to_save = []
+        for itm in items:
+            d = itm.copy()
+            d['pubDate'] = itm['pubDate'].isoformat()
+            to_save.append(d)
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(to_save, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Błąd zapisu cache:", e)
+
+def open_url(url):
+    try:
+        subprocess.Popen(
+            ['xdg-open', url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        print("Błąd otwierania URL:", e)
 
 class TorrentWindow(Gtk.Window):
     def __init__(self):
-        super().__init__(title="Electro-Torrent.pl RSS - Najnowsze filmy i seriale")
-        self.set_default_size(800,600)
+        super().__init__(title="Electro-Torrent.pl RSS")
+        self.set_default_size(800, 600)
+
+        # wczytaj cache
+        self.items = load_cache()
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.add(vbox)
 
-        # górny panel: okres + spinner + przyciski
+        # panel sterowania
         cfg = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         vbox.pack_start(cfg, False, False, 0)
-
         cfg.pack_start(Gtk.Label(label="Okres (dni):"), False, False, 0)
         self.days = Gtk.ComboBoxText()
         for d in ("7","14"):
             self.days.append_text(d)
         self.days.set_active(0)
         cfg.pack_start(self.days, False, False, 0)
-
-        # spinner ładowania
         self.spinner = Gtk.Spinner()
         cfg.pack_start(self.spinner, False, False, 0)
-
         btn_clean = Gtk.Button(label="Wyczyść")
         btn_clean.connect("clicked", self.on_clean)
         cfg.pack_start(btn_clean, False, False, 0)
-
         btn_refresh = Gtk.Button(label="Odśwież")
         btn_refresh.connect("clicked", self.on_refresh)
         cfg.pack_start(btn_refresh, False, False, 0)
 
-        # stos stron
+        # stos widoków
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.stack.set_transition_duration(200)
         vbox.pack_start(self.stack, True, True, 0)
 
-        # nawigacja + wskaźnik
+        # nawigacja
         nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         vbox.pack_start(nav, False, False, 0)
         btn_prev = Gtk.Button(label="« Poprzednia")
-        btn_prev.connect("clicked", lambda w: self.page(-1))
+        btn_prev.connect("clicked", lambda _, d=-1: self.page(d))
         nav.pack_start(btn_prev, False, False, 0)
         self.page_label = Gtk.Label(label="0/0")
         nav.pack_start(self.page_label, True, True, 0)
         btn_next = Gtk.Button(label="Następna »")
-        btn_next.connect("clicked", lambda w: self.page(+1))
+        btn_next.connect("clicked", lambda _, d=1: self.page(d))
         nav.pack_start(btn_next, False, False, 0)
 
-        # wczytaj cache
-        self.items = load_cache() if os.path.exists(CACHE_FILE) else []
         self.build_pages()
 
-    def on_clean(self, w):
+    def on_clean(self, _):
         if os.path.exists(CACHE_FILE):
             os.remove(CACHE_FILE)
         self.items = []
         self.build_pages()
 
-    def on_refresh(self, w):
-        # blokuj przycisk i start spinnera
-        w.set_sensitive(False)
+    def on_refresh(self, button):
+        button.set_sensitive(False)
         self.spinner.start()
         days = int(self.days.get_active_text())
-        threading.Thread(
-            target=self._refresh_thread,
-            args=(days, w),
-            daemon=True
-        ).start()
+        threading.Thread(target=self._refresh_thread, args=(days, button), daemon=True).start()
 
     def _refresh_thread(self, days, button):
-        if os.path.exists(CACHE_FILE):
-            os.remove(CACHE_FILE)
         items = fetch_items(days)
         save_cache(items)
         GLib.idle_add(self._on_refresh_done, items, button)
@@ -205,31 +214,31 @@ class TorrentWindow(Gtk.Window):
         self.pages = []
 
         if not self.items:
-            lbl = Gtk.Label(label=f"Brak wyników w ostatnich {self.days.get_active_text()} dniach, kliknij przycisk Odśwież.")
-            self.stack.add_named(lbl, "empty"); lbl.show()
-            self.pages.append(lbl)
+            lbl = Gtk.Label(label=f"Brak wyników w ostatnich {self.days.get_active_text()} dniach, kliknij Odśwież.")
+            self.stack.add_named(lbl, "empty")
+            lbl.show()
+            self.pages = [lbl]
         else:
             for i in range(0, len(self.items), 20):
-                p = self.make_page(self.items[i:i+20])
+                page = self.make_page(self.items[i:i+20])
                 name = f"page{i//20}"
-                self.stack.add_named(p, name)
-                p.show_all()
-                self.pages.append(p)
+                self.stack.add_named(page, name)
+                page.show_all()
+                self.pages.append(page)
 
         self.current_page = 0
-        self.pages_count  = len(self.pages)
+        self.pages_count = len(self.pages)
         self.page_label.set_text(f"{self.current_page+1}/{self.pages_count}")
         self.stack.set_visible_child(self.pages[0])
 
     def make_page(self, subset):
         sw = Gtk.ScrolledWindow()
-        v  = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        sw.add(v)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        sw.add(box)
 
         for itm in subset:
             h = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
 
-            # miniaturka
             if itm['thumb']:
                 try:
                     data = requests.get(itm['thumb'], timeout=3).content
@@ -242,16 +251,11 @@ class TorrentWindow(Gtk.Window):
                     pass
 
             esc = GLib.markup_escape_text
-            title = esc(itm['title']); year = esc(itm['year'])
-            quality= esc(itm['quality']); lekt = esc(itm['lektor'])
-            napis = esc(itm['napisy']); dubb = esc(itm['dubbing'])
-            cat = 'Seriale' if itm['category']=='Seriale' else 'Filmy'
-            color = 'purple' if cat=='Seriale' else 'blue'
-
+            color = 'purple' if itm['category']=='Seriale' else 'blue'
             lines = [
-                f"<b>Tytuł: {title} ({year})</b>",
-                f"<span foreground='{color}'><b>Kategoria: {cat}</b></span>",
-                f"Jakość: {quality}",
+                f"<b>Tytuł: {esc(itm['title'])} ({esc(itm['year'])})</b>",
+                f"<span foreground='{color}'><b>Kategoria: {esc(itm['category'])}</b></span>",
+                f"Jakość: {esc(itm['quality'])}",
             ]
             if itm['season']:
                 s = f"Sezon: {esc(itm['season'])}"
@@ -259,9 +263,9 @@ class TorrentWindow(Gtk.Window):
                     s += f"  Odcinek: {esc(itm['episode'])}"
                 lines.append(s)
             lines += [
-                f"Lektor: {lekt}",
-                f"Napisy: {napis}",
-                f"Dubbing: {dubb}",
+                f"Lektor: {esc(itm['lektor'])}",
+                f"Napisy: {esc(itm['napisy'])}",
+                f"Dubbing: {esc(itm['dubbing'])}",
                 f"Data: {itm['pubDate'].strftime('%Y-%m-%d %H:%M')}"
             ]
 
@@ -274,28 +278,24 @@ class TorrentWindow(Gtk.Window):
 
             if itm.get('link'):
                 btn = Gtk.Button(label="Otwórz")
-                btn.connect("clicked", lambda w, url=itm['link']: webbrowser.open(url))
+                btn.connect("clicked", lambda _, url=itm['link']: open_url(url))
                 h.pack_start(btn, False, False, 0)
 
-            v.pack_start(h, False, False, 0)
+            box.pack_start(h, False, False, 0)
 
         return sw
 
     def page(self, delta):
         if not self.pages:
             return
-        cur = self.stack.get_visible_child()
-        try:
-            idx = self.pages.index(cur) + delta
-        except ValueError:
-            idx = 0
-        idx = max(0, min(idx, self.pages_count-1))
+        idx = max(0, min(self.current_page+delta, self.pages_count-1))
         self.current_page = idx
         self.stack.set_visible_child(self.pages[idx])
-        self.page_label.set_text(f"{self.current_page+1}/{self.pages_count}")
+        self.page_label.set_text(f"{idx+1}/{self.pages_count}")
 
 if __name__ == "__main__":
     win = TorrentWindow()
     win.connect("destroy", Gtk.main_quit)
     win.show_all()
     Gtk.main()
+
